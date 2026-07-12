@@ -1,38 +1,19 @@
 #!/usr/bin/env python3
-"""
-====================================================================
-    RASTREADOR DE GESTOS COM MACACO
-====================================================================
-
-Descrição:
-    Sistema de reconhecimento de gestos em tempo real que detecta
-    movimentos específicos das mãos usando a câmera e exibe imagens
-    de um macaco realizando o mesmo gesto.
-
-Gestos Reconhecidos:
-    1. Neutro - Posição padrão/repouso
-    2. Dedo no canto da boca - Indicador próximo ao rosto
-    3. Dedo indicador para cima - Indicador apontando para cima
-    4. Mão no peito - Mão aberta na região do peito
-
-Tecnologias:
-    - OpenCV: Captura e processamento de vídeo
-    - MediaPipe: Detecção e rastreamento de mãos
-    - NumPy: Operações matemáticas
-
-Autor: Sistema de Rastreamento de Gestos
-Data: 2025
-====================================================================
-"""
-
+import sys, io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 import math
 # ============================================================
 # IMPORTAÇÕES
 # ============================================================
 import os
+import time
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python.vision import drawing_utils, drawing_styles, HandLandmarksConnections, FaceDetector, FaceDetectorOptions
+from pygrabber.dshow_graph import FilterGraph
 import numpy as np
 
 
@@ -56,21 +37,32 @@ class GestureTracker:
         """Inicializa o rastreador de gestos e carrega os recursos necessários."""
         
         # ========================================
-        # Inicialização do MediaPipe
+        # Inicialização do MediaPipe (Tasks API)
         # ========================================
-        self.mp_hands = mp.solutions.hands  # type: ignore
-        self.mp_drawing = mp.solutions.drawing_utils  # type: ignore
-        self.mp_drawing_styles = mp.solutions.drawing_styles  # type: ignore
+        model_path = os.path.join(os.path.dirname(__file__), "models", "hand_landmarker.task")
+        
+        base_options = mp_python.BaseOptions(model_asset_path=model_path)
+        options = mp_vision.HandLandmarkerOptions(
+            base_options=base_options,
+            running_mode=mp_vision.RunningMode.VIDEO,
+            num_hands=2,
+            min_hand_detection_confidence=0.5,
+            min_hand_presence_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.hand_landmarker = mp_vision.HandLandmarker.create_from_options(options)
         
         # ========================================
-        # Configuração do Detector de Mãos
+        # Inicialização do Detector de Rosto (Tasks API)
         # ========================================
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False,        # False = modo de vídeo (mais rápido)
-            max_num_hands=2,                # Detecta até 2 mãos simultaneamente
-            min_detection_confidence=0.5,   # Confiança mínima para detecção (0-1)
-            min_tracking_confidence=0.5     # Confiança mínima para rastreamento (0-1)
+        face_model_path = os.path.join(os.path.dirname(__file__), "models", "face_detector.tflite")
+        
+        face_base_options = mp_python.BaseOptions(model_asset_path=face_model_path)
+        face_options = mp_vision.FaceDetectorOptions(
+            base_options=face_base_options,
+            min_detection_confidence=0.5
         )
+        self.face_detector = mp_vision.FaceDetector.create_from_options(face_options)
         
         # ========================================
         # Recursos do Sistema
@@ -96,17 +88,24 @@ class GestureTracker:
             os.makedirs(image_dir)
             print(f"📁 Criado diretório {image_dir}")
             print("⚠️  Adicione imagens de macacos nesta pasta:")
-            print("   - neutral.png (posição neutra)")
-            print("   - finger_mouth.png (dedo no canto da boca)")
-            print("   - finger_up.png (dedo indicador para cima)")
-            print("   - hand_chest.png (mão no peito)")
+            print("   - neutral.png (posicao neutra)")
+            print("   - absolute_cinema.png (duas maos abertas)")
+            print("   - nerd.png (dedo indicador levantado)")
+            print("   - jerry.png (dedao levantado)")
+            print("   - fazoL.png (polegar + indicador, 1 mao)")
+            print("   - son.png (mao fechada)")
         
         # Mapeamento dos gestos e seus arquivos
         gesture_files = {
             "neutral": "neutral.png",
-            "finger_mouth": "finger_mouth.png",
-            "finger_up": "finger_up.png",
-            "hand_chest": "hand_chest.png"
+            "absolute_cinema": "absolute_cinema.png",
+            "nerd": "nerd.png",
+            "jerry": "jerry.png",
+            "fazoL": "fazoL.png",
+            "angry_ouvindo": "angry_ouvindo.png",
+            "time_shak": "time_shak.png",
+            "son": "son.png",
+            "go_drinking": "go_drinking.png"
         }
         
         # Carregar cada imagem
@@ -138,17 +137,11 @@ class GestureTracker:
         
         Args:
             hand_landmarks: Lista de landmarks (21 pontos) da mão
-            handedness: "Right" ou "Left" (mão direita ou esquerda)
+            handedness: "Right" ou "Left" (não usado, mantido por compatibilidade)
         
         Returns:
             list: Lista de 5 elementos [polegar, indicador, médio, anelar, mínimo]
                   onde 1 = levantado e 0 = abaixado
-        
-        Nota:
-            O MediaPipe detecta 21 landmarks por mão:
-            - 0: Pulso
-            - 4, 8, 12, 16, 20: Pontas dos dedos
-            - 3, 6, 10, 14, 18: Articulações médias
         """
         fingers_up = []
         
@@ -157,33 +150,30 @@ class GestureTracker:
         finger_pips = [3, 6, 10, 14, 18]    # Articulações para comparação
         
         # ========================================
-        # POLEGAR (lógica horizontal)
+        # POLEGAR (lógica por distância)
         # ========================================
-        # O polegar se move horizontalmente, então comparamos coordenadas X
-        if handedness == "Right":
-            # Mão direita: polegar levantado = ponta mais à esquerda que articulação
-            if hand_landmarks[finger_tips[0]].x < hand_landmarks[finger_pips[0]].x:
-                fingers_up.append(1)
-            else:
-                fingers_up.append(0)
-        else:  # Left
-            # Mão esquerda: polegar levantado = ponta mais à direita que articulação
-            if hand_landmarks[finger_tips[0]].x > hand_landmarks[finger_pips[0]].x:
-                fingers_up.append(1)
-            else:
-                fingers_up.append(0)
+        # Compara distância da ponta (4) vs articulação (3) até a base do indicador (5)
+        # Quando o polegar está estendido, a ponta fica mais longe da base do indicador
+        tip = hand_landmarks[4]
+        ip = hand_landmarks[3]
+        base = hand_landmarks[5]
+        
+        dist_tip = math.hypot(tip.x - base.x, tip.y - base.y)
+        dist_ip = math.hypot(ip.x - base.x, ip.y - base.y)
+        
+        if dist_tip > dist_ip:
+            fingers_up.append(1)
+        else:
+            fingers_up.append(0)
         
         # ========================================
         # OUTROS DEDOS (lógica vertical)
         # ========================================
-        # Os outros dedos se movem verticalmente, então comparamos coordenadas Y
         for i in range(1, 5):
-            # Dedo levantado = ponta (Y menor) acima da articulação (Y maior)
-            # Nota: No OpenCV, Y cresce de cima para baixo
             if hand_landmarks[finger_tips[i]].y < hand_landmarks[finger_pips[i]].y:
-                fingers_up.append(1)  # Levantado
+                fingers_up.append(1)
             else:
-                fingers_up.append(0)  # Abaixado
+                fingers_up.append(0)
         
         return fingers_up
     
@@ -191,90 +181,28 @@ class GestureTracker:
     # MÉTODO: Detectar Gesto
     # ========================================
     def detect_gesture(self, hand_landmarks, handedness):
-        """
-        Identifica o gesto que está sendo realizado.
-        
-        Args:
-            hand_landmarks: Lista de 21 landmarks da mão
-            handedness: "Right" ou "Left"
-        
-        Returns:
-            str: Nome do gesto detectado ("finger_mouth", "finger_up", 
-                 "hand_chest", ou "neutral")
-        
-        Lógica de Detecção:
-            - Analisa quais dedos estão levantados
-            - Calcula posições e distâncias entre landmarks
-            - Aplica regras específicas para cada gesto
-        """
-        # Obter estado dos dedos (quais estão levantados)
         fingers = self.count_fingers(hand_landmarks, handedness)
-        fingers_count = sum(fingers)  # Total de dedos levantados
-        
-        # fingers = [polegar, indicador, médio, anelar, mínimo]
-        # Exemplo: [0, 1, 0, 0, 0] = apenas indicador levantado
-        
-        # ========================================
-        # Extrair Landmarks Importantes
-        # ========================================
-        wrist = hand_landmarks[0]          # Pulso (base da mão)
-        thumb_tip = hand_landmarks[4]      # Ponta do polegar
-        index_tip = hand_landmarks[8]      # Ponta do indicador
-        index_pip = hand_landmarks[6]      # Articulação do indicador
-        middle_tip = hand_landmarks[12]    # Ponta do dedo médio
-        
-        # ========================================
-        # GESTO 1: Dedo no Canto da Boca (SIMPLIFICADO)
-        # ========================================
-        # Condições mais flexíveis para facilitar detecção:
-        #   - Indicador levantado
-        #   - Até 3 dedos levantados (mais tolerante)
-        #   - Mão na parte superior ou média da tela
-        #   - Se não for claramente o gesto "finger_up"
-        
-        if fingers[1] == 1 and fingers_count <= 3:  # Indicador levantado com até 3 dedos
-            # Não é o gesto finger_up (que tem o dedo BEM esticado para cima)
-            is_finger_up = (fingers == [0, 1, 0, 0, 0] and index_tip.y < wrist.y - 0.2)
-            
-            if not is_finger_up and index_tip.y < 0.7:  # Não é finger_up E está na metade superior
-                return "finger_mouth"
-        
-        # ========================================
-        # GESTO 2: Dedo Indicador Para Cima
-        # ========================================
-        # Condições:
-        #   - Apenas indicador levantado
-        #   - Indicador apontando bem para cima (acima do pulso)
-        
-        if (fingers == [0, 1, 0, 0, 0] and         # Só indicador levantado
-            index_tip.y < wrist.y - 0.2):          # Bem acima do pulso
-            return "finger_up"
-        
-        # ========================================
-        # GESTO 3: Mão no Peito
-        # ========================================
-        # Condições:
-        #   - Mão na parte inferior da tela (região do peito)
-        #   - Mão centralizada horizontalmente
-        #   - Vários dedos visíveis (mão aberta/plana)
-        
-        # Calcular posição média/centro da mão
-        hand_center_x = sum([hand_landmarks[i].x for i in [0, 5, 9, 13, 17]]) / 5
-        hand_center_y = sum([hand_landmarks[i].y for i in [0, 5, 9, 13, 17]]) / 5
-        
-        chest_region_y = 0.6      # Região do peito (parte inferior, Y > 0.6)
-        chest_region_x = 0.5      # Centro horizontal (X ≈ 0.5)
-        
-        if (hand_center_y > chest_region_y and              # Parte inferior
-            abs(hand_center_x - chest_region_x) < 0.3 and   # Próximo ao centro
-            fingers_count >= 3):                            # Pelo menos 3 dedos
-            return "hand_chest"
-        
-        # ========================================
-        # GESTO PADRÃO: Neutro
-        # ========================================
-        # Retorna se nenhum gesto específico for detectado
-        return "neutral"
+        fingers_count = sum(fingers)
+
+        if fingers == [1, 0, 0, 0, 0]:
+            return "jerry"
+
+        if fingers == [1, 1, 0, 0, 0]:
+            return "fazoL"
+
+        if fingers == [0, 1, 0, 0, 0]:
+            return "nerd"
+
+        if fingers == [0, 1, 1, 1, 1]:
+            return "time_shak"
+
+        if fingers_count == 5:
+            return "angry_ouvindo"
+
+        if fingers_count == 0:
+            return "son"
+
+        return None
     
     # ========================================
     # MÉTODO: Sobrepor Imagem
@@ -337,74 +265,98 @@ class GestureTracker:
     # MÉTODO: Listar Câmeras Disponíveis
     # ========================================
     def list_cameras(self):
-        """
-        Detecta todas as câmeras disponíveis no sistema.
-        
-        Returns:
-            list: Lista com os índices das câmeras disponíveis (ex: [0, 1, 2])
-        
-        Nota:
-            Testa até 10 possíveis câmeras (índices 0-9)
-        """
         available_cameras = []
+        seen = set()
         print("\n🔍 Procurando câmeras disponíveis...")
-        
-        # Testar índices de 0 a 9
+
+        graph = FilterGraph()
+        try:
+            dshow_names = graph.get_input_devices()
+        except Exception:
+            dshow_names = []
+
+        backends = [
+            ("DSHOW", cv2.CAP_DSHOW),
+            ("MSMF", cv2.CAP_MSMF),
+        ]
+
+        for i, dshow_name in enumerate(dshow_names):
+            for backend_label, backend_id in backends:
+                try:
+                    cap = cv2.VideoCapture(i, backend_id)
+                except Exception:
+                    continue
+                if cap.isOpened():
+                    ret, _ = cap.read()
+                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    cap.release()
+                    if ret and w > 0:
+                        key = (i, w)
+                        if key not in seen:
+                            seen.add(key)
+                            available_cameras.append({
+                                "index": i,
+                                "backend": backend_id,
+                                "name": dshow_name
+                            })
+
         for i in range(10):
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                available_cameras.append(i)
-                cap.release()  # Liberar a câmera
-        
+            for backend_label, backend_id in backends:
+                try:
+                    cap = cv2.VideoCapture(i, backend_id)
+                except Exception:
+                    continue
+                if cap.isOpened():
+                    ret, _ = cap.read()
+                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    cap.release()
+                    if ret and w > 0:
+                        key = (i, w)
+                        if key not in seen:
+                            seen.add(key)
+                            available_cameras.append({
+                                "index": i,
+                                "backend": backend_id,
+                                "name": f"Câmera {i}"
+                            })
+
         return available_cameras
-    
-    # ========================================
-    # MÉTODO: Selecionar Câmera
-    # ========================================
+
     def select_camera(self):
-        """
-        Permite ao usuário escolher qual câmera usar.
-        
-        Returns:
-            int: Índice da câmera selecionada (ou None se nenhuma disponível)
-        
-        Comportamento:
-            - Se apenas 1 câmera: usa automaticamente
-            - Se múltiplas câmeras: pede para o usuário escolher
-            - Se nenhuma câmera: retorna None
-        """
         cameras = self.list_cameras()
-        
-        # Nenhuma câmera encontrada
+
         if not cameras:
             print("❌ Nenhuma câmera encontrada!")
             return None
-        
-        print(f"\n📹 Câmeras disponíveis: {cameras}")
-        
-        # Apenas uma câmera - usar automaticamente
+
+        print(f"\n📹 Câmeras disponíveis:")
+        for cam in cameras:
+            print(f"   [{cam['index']}] {cam['name']}")
+
         if len(cameras) == 1:
-            print(f"✅ Usando câmera {cameras[0]}")
+            print(f"\n✅ Usando: {cameras[0]['name']}")
             return cameras[0]
-        
-        # Múltiplas câmeras - pedir escolha do usuário
+
         while True:
             try:
-                choice = input(f"\nEscolha a câmera {cameras} (padrão: {cameras[0]}): ").strip()
-                
-                # Se usuário pressionar ENTER, usar câmera padrão
+                options = [str(c["index"]) for c in cameras]
+                choice = input(f"\nEscolha o índice da câmera ({options[0]} padrão): ").strip()
+
                 if choice == "":
+                    print(f"✅ Usando: {cameras[0]['name']}")
                     return cameras[0]
-                
-                # Validar escolha
+
                 choice_int = int(choice)
-                if choice_int in cameras:
-                    return choice_int
+                valid = [c["index"] for c in cameras]
+                if choice_int in valid:
+                    chosen = next(c for c in cameras if c["index"] == choice_int)
+                    print(f"✅ Usando: {chosen['name']}")
+                    return chosen
                 else:
-                    print(f"⚠️  Câmera {choice_int} não está disponível. Escolha entre: {cameras}")
-            
+                    print(f"⚠️  Câmera {choice_int} não disponível. Opções: {valid}")
+
             except ValueError:
-                print("⚠️  Por favor, digite um número válido.")
+                print("⚠️  Digite um número válido.")
             except KeyboardInterrupt:
                 print("\n\n❌ Operação cancelada pelo usuário.")
                 return None
@@ -413,210 +365,186 @@ class GestureTracker:
     # MÉTODO PRINCIPAL: Loop de Execução
     # ========================================
     def run(self, camera_id=None):
-        """
-        Executa o loop principal do rastreador de gestos.
-        
-        Args:
-            camera_id: Índice da câmera a usar (None = pedir ao usuário)
-        
-        Fluxo de Execução:
-            1. Selecionar/abrir câmera
-            2. Capturar frame
-            3. Detectar mãos
-            4. Reconhecer gestos
-            5. Exibir resultado + imagem do macaco
-            6. Repetir até usuário pressionar 'q'
-        """
-        
-        # ========================================
-        # Inicialização da Câmera
-        # ========================================
         if camera_id is None:
             camera_id = self.select_camera()
             if camera_id is None:
                 return
-        
-        cap = cv2.VideoCapture(camera_id)
-        
+
+        if isinstance(camera_id, dict):
+            cam_index = camera_id["index"]
+            cam_backend = camera_id["backend"]
+            cam_name = camera_id["name"]
+        else:
+            cam_index = camera_id
+            cam_backend = cv2.CAP_ANY
+            cam_name = f"Câmera {camera_id}"
+
+        cap = cv2.VideoCapture(cam_index, cam_backend)
+
         if not cap.isOpened():
-            print(f"❌ Erro: Não foi possível abrir a câmera {camera_id}")
+            print(f"❌ Erro: Não foi possível abrir a câmera {cam_name}")
             return
-        
-        # ========================================
-        # Informações Iniciais
-        # ========================================
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if width == 0 or height == 0:
+            width, height = 640, 480
+
         print("\n" + "=" * 60)
         print("🎥 CÂMERA INICIADA!")
         print("=" * 60)
-        print(f"📹 Usando câmera: {camera_id}")
+        print(f"📹 Usando câmera: {cam_name} ({width}x{height})")
         print("\n👋 GESTOS DISPONÍVEIS:")
-        print("   ☝️  Dedo indicador para cima")
-        print("   😏 Dedo no canto da boca")
-        print("   🫱 Mão no peito")
-        print("   😐 Neutro (sem gesto específico)")
+        print("   🙌  Duas maos abertas = ABSOLUTE CINEMA")
+        print("   🤙  Polegar + indicador (2 maos) = GO DRINKING")
+        print("   ☝️  Dedo indicador levantado = Nerd")
+        print("   👍  Dedao levantado = Jerry")
+        print("   🤙  Polegar + indicador (1 mao) = Fazo L")
+        print("   🖐️  5 dedos levantados = Angry")
+        print("   🖐️  4 dedos levantados = Time Shak")
+        print("   ✊  Mao fechada = Son")
+        print("   😐  Neutro (sem gesto)")
         print("\n⌨️  Pressione 'q' para sair")
         print("=" * 60 + "\n")
-        
-        # ========================================
-        # Configurar Janelas
-        # ========================================
-        # Criar janelas nomeadas
-        cv2.namedWindow('Camera - Rastreador de Gestos', cv2.WINDOW_NORMAL)
-        cv2.namedWindow('Macaco - Gesto Detectado', cv2.WINDOW_NORMAL)
-        
-        # Posicionar janelas lado a lado
-        cv2.moveWindow('Camera - Rastreador de Gestos', 50, 100)    # Janela da esquerda
-        cv2.moveWindow('Macaco - Gesto Detectado', 750, 100)        # Janela da direita
-        
-        # ========================================
-        # Loop Principal
-        # ========================================
+
+        cv2.namedWindow('Gesture Tracker', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Gesture Tracker', width, height)
+        cv2.moveWindow('Gesture Tracker', 50, 100)
+
+        virtual_cam = None
+        try:
+            import pyvirtualcam
+            virtual_cam = pyvirtualcam.Camera(width=width, height=height, fps=30)
+            print(f"📺 pyvirtualcam ativo: {virtual_cam.device}")
+        except Exception as e:
+            print(f"⚠️  pyvirtualcam indisponível ({e})")
+
+        gesture_names = {
+            "neutral": "Neutro",
+            "absolute_cinema": "ABSOLUTE CINEMA",
+            "nerd": "Nerd",
+            "jerry": "Jerry",
+            "fazoL": "Fazo L",
+            "angry_ouvindo": "Angry",
+            "time_shak": "Time Shak",
+            "son": "Son",
+            "go_drinking": "Go Drinking"
+        }
+
         while cap.isOpened():
-            # Capturar frame da câmera
             success, image = cap.read()
-            
             if not success:
-                print("⚠️  Frame vazio - ignorando...")
                 continue
-            
-            # ========================================
-            # Pré-processamento da Imagem
-            # ========================================
-            # Espelhar horizontalmente (efeito espelho mais natural)
+
             image = cv2.flip(image, 1)
-            
-            # Converter de BGR (OpenCV) para RGB (MediaPipe)
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            image_rgb.flags.writeable = False  # Otimização de performance
-            
+            timestamp_ms = int(time.time() * 1000)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+
+            results = self.hand_landmarker.detect_for_video(mp_image, timestamp_ms)
+
             # ========================================
-            # Detecção de Mãos
+            # DETECÇÃO DE ROSTO
             # ========================================
-            results = self.hands.process(image_rgb)
-            
-            # Converter de volta para BGR
-            image_rgb.flags.writeable = True
-            image = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-            
-            # ========================================
-            # Processar Mãos Detectadas
-            # ========================================
-            if results.multi_hand_landmarks and results.multi_handedness:
-                # Iterar sobre cada mão detectada
+            face_results = self.face_detector.detect(mp_image)
+            face_bbox = None
+            if face_results.detections:
+                detection = face_results.detections[0]
+                bbox = detection.bounding_box
+                face_bbox = {
+                    "x": bbox.origin_x,
+                    "y": bbox.origin_y,
+                    "width": bbox.width,
+                    "height": bbox.height
+                }
+
+            if results.hand_landmarks and results.handedness:
+                all_hands = []
                 for hand_landmarks, handedness in zip(
-                    results.multi_hand_landmarks, 
-                    results.multi_handedness
+                    results.hand_landmarks,
+                    results.handedness
                 ):
-                    # Desenhar landmarks (pontos e conexões) na imagem
-                    self.mp_drawing.draw_landmarks(
-                        image,
-                        hand_landmarks,
-                        self.mp_hands.HAND_CONNECTIONS,
-                        self.mp_drawing_styles.get_default_hand_landmarks_style(),
-                        self.mp_drawing_styles.get_default_hand_connections_style()
-                    )
-                    
-                    # Detectar o gesto
-                    hand_label = handedness.classification[0].label  # "Left" ou "Right"
-                    gesture = self.detect_gesture(hand_landmarks.landmark, hand_label)
-                    self.current_gesture = gesture
-                    
-                    # Exibir nome do gesto na tela
-                    cv2.putText(
-                        image,
-                        f"Gesto: {gesture}",
-                        (10, 30),                      # Posição (x, y)
-                        cv2.FONT_HERSHEY_SIMPLEX,      # Fonte
-                        1,                              # Tamanho
-                        (0, 255, 0),                   # Cor verde (BGR)
-                        2                               # Espessura
-                    )
-            else:
-                # Nenhuma mão detectada - gesto neutro
+                    hand_label = handedness[0].category_name
+                    all_hands.append((hand_landmarks, hand_label))
+
                 self.current_gesture = "neutral"
-            
-            # ========================================
-            # Exibir Frame da Câmera
-            # ========================================
-            cv2.imshow('Camera - Rastreador de Gestos', image)
-            
-            # ========================================
-            # Exibir Imagem do Macaco em Janela Separada
-            # ========================================
-            if self.current_gesture in self.monkey_images:
+
+                if len(all_hands) >= 2:
+                    both_open = True
+                    for hl, hl_label in all_hands:
+                        fingers = self.count_fingers(hl, hl_label)
+                        if sum(fingers) != 5:
+                            both_open = False
+                            break
+                    if both_open:
+                        self.current_gesture = "absolute_cinema"
+
+                    if self.current_gesture == "neutral":
+                        both_drink = True
+                        for hl, hl_label in all_hands:
+                            fingers = self.count_fingers(hl, hl_label)
+                            if fingers != [1, 1, 0, 0, 0]:
+                                both_drink = False
+                                break
+                        if both_drink:
+                            self.current_gesture = "go_drinking"
+
+                if self.current_gesture == "neutral":
+                    for hl, hl_label in all_hands:
+                        gesture = self.detect_gesture(hl, hl_label)
+                        if gesture is not None:
+                            self.current_gesture = gesture
+                            break
+            else:
+                self.current_gesture = "neutral"
+
+            gesture_text = gesture_names.get(self.current_gesture, self.current_gesture)
+
+            if self.current_gesture in self.monkey_images and self.current_gesture != "neutral" and face_bbox is not None:
                 monkey_img = self.monkey_images[self.current_gesture]
                 
-                # Criar imagem maior para melhor visualização
-                display_size = (600, 600)  # Tamanho maior: 600x600 pixels
-                monkey_display = cv2.resize(monkey_img, display_size)
+                # Calcular tamanho proporcional ao rosto (80% da largura do rosto)
+                face_width = face_bbox["width"]
+                thumb_size = int(face_width * 0.8)
                 
-                # Adicionar fundo branco se a imagem tiver canal alpha
-                if monkey_display.shape[2] == 4:
-                    # Criar fundo branco
-                    background = np.ones((display_size[1], display_size[0], 3), dtype=np.uint8) * 255
-                    
-                    # Aplicar transparência
-                    alpha = monkey_display[:, :, 3] / 255.0
-                    for c in range(3):
-                        background[:, :, c] = (
-                            alpha * monkey_display[:, :, c] +
-                            (1 - alpha) * background[:, :, c]
-                        )
-                    monkey_display = background
+                # Garantir tamanho mínimo e máximo
+                thumb_size = max(80, min(thumb_size, 300))
                 
-                # Adicionar texto com o nome do gesto
-                gesture_names = {
-                    "neutral": "Neutro",
-                    "finger_mouth": "Dedo no Canto da Boca",
-                    "finger_up": "Dedo Indicador Para Cima",
-                    "hand_chest": "Mao no Peito"
-                }
-                
-                gesture_text = gesture_names.get(self.current_gesture, self.current_gesture)
-                
-                # Adicionar barra preta no topo para o texto
-                text_bar = np.zeros((60, display_size[0], 3), dtype=np.uint8)
-                cv2.putText(
-                    text_bar,
-                    gesture_text,
-                    (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.2,
-                    (255, 255, 255),
-                    2
-                )
-                
-                # Concatenar barra de texto com a imagem
-                final_display = np.vstack([text_bar, monkey_display])
-                
-                # Exibir em janela separada
-                cv2.imshow('Macaco - Gesto Detectado', final_display)
-            else:
-                # Se não houver gesto, mostrar mensagem
-                blank = np.ones((660, 600, 3), dtype=np.uint8) * 200
-                cv2.putText(
-                    blank,
-                    "Aguardando gesto...",
-                    (150, 330),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.2,
-                    (100, 100, 100),
-                    2
-                )
-                cv2.imshow('Macaco - Gesto Detectado', blank)
-            
-            # ========================================
-            # Verificar Tecla Pressionada
-            # ========================================
+                thumb = cv2.resize(monkey_img, (thumb_size, thumb_size))
+
+                # Posicionar acima da cabeça, centralizado horizontalmente
+                face_center_x = face_bbox["x"] + face_bbox["width"] // 2
+                x0 = face_center_x - thumb_size // 2
+                y0 = face_bbox["y"] - thumb_size  # Acima do topo do rosto
+
+                # Ajustar limites da tela
+                x0 = max(0, min(x0, width - thumb_size))
+                y0 = max(0, min(y0, height - thumb_size))
+
+                if thumb.shape[2] == 4:
+                    alpha = thumb[:, :, 3:] / 255.0
+                    roi = image[y0:y0 + thumb_size, x0:x0 + thumb_size]
+                    image[y0:y0 + thumb_size, x0:x0 + thumb_size] = (
+                        alpha * thumb[:, :, :3] + (1 - alpha) * roi
+                    ).astype(np.uint8)
+                else:
+                    image[y0:y0 + thumb_size, x0:x0 + thumb_size] = thumb
+
+            cv2.imshow('Gesture Tracker', image)
+
+            if virtual_cam is not None:
+                output_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                virtual_cam.send(output_rgb)
+                virtual_cam.sleep_until_next_frame()
+
             if cv2.waitKey(5) & 0xFF == ord('q'):
                 print("\n👋 Saindo...")
                 break
-        
-        # ========================================
-        # Limpeza e Encerramento
-        # ========================================
+
         cap.release()
         cv2.destroyAllWindows()
+        if virtual_cam is not None:
+            virtual_cam.close()
         print("✅ Programa encerrado com sucesso!")
         print("=" * 60 + "\n")
 
@@ -659,5 +587,4 @@ def main():
 # EXECUÇÃO DO PROGRAMA
 # ============================================================
 if __name__ == "__main__":
-    main()
     main()
